@@ -18,7 +18,7 @@ public class WideCameraHook implements IXposedHookLoadPackage {
     // Keep "wide" visible in the menu, but hand the stream/size layer a
     // HAL-supported ratio so preview can actually be configured.
     private static final String RATIO_FALLBACK = "full";
-    // 65:24 XPAN target ratio (7872 / 2912)
+    // 65:24 wide-frame target ratio (7872 / 2912)
     private static final double TARGET_RATIO = 7872.0 / 2912.0;
     // Watermark switches consulted by the picture pipeline. The capture
     // pipeline reads pref_watermark_function_key / the Hasselblad one, while
@@ -59,6 +59,10 @@ public class WideCameraHook implements IXposedHookLoadPackage {
     private volatile boolean mWideActive = false;
     private volatile long mLoadTime = 0L;
     private volatile boolean mPostProcStarted = false;
+    // Encoder-declared size per OplusHeifWriter instance, so the HEIF pixel
+    // buffer can be matched to a layout at processPrimaryImage time.
+    private final java.util.Map<Integer, int[]> sHeifDims =
+            new java.util.concurrent.ConcurrentHashMap<Integer, int[]>();
     private final java.util.Map<String, Long> mLastSize =
             new java.util.concurrent.ConcurrentHashMap<String, Long>();
 
@@ -207,7 +211,7 @@ public class WideCameraHook implements IXposedHookLoadPackage {
     }
 
     /**
-     * XPan is 65:24. The preview is a 4:3 frame drawn upright and centre-cropped
+     * The wide frame is 65:24. The preview is a 4:3 frame drawn upright and centre-cropped
      * to fill this portrait panel, so part of the sensor's short edge is already
      * gone before we ever see it; the wide slice that survives is 24/65 of the
      * screen height, centred, with the black bars left and right. The surface is
@@ -521,66 +525,16 @@ public class WideCameraHook implements IXposedHookLoadPackage {
         hookSetOptionItems(lpparam);
         hookGnNJ(lpparam);
         hookAnBR(lpparam);
-        hookModeTracker(lpparam);
         hookRatioGetter(lpparam);
-        hookXpanConfigGate(lpparam);
-        hookXpanDrawableFallback(lpparam);
         hookBitmapCompress(lpparam);
         hookFileOutputStreamWrite(lpparam);
         hookFileChannelWrite(lpparam);
         hookKcM1G(lpparam);
+        hookOplusHeifWriter(lpparam);
+        hookHeifFormatSwitch(lpparam);
         hookPreviewCrop(lpparam);
         hookWatermarkSwitch(lpparam);
         startPostProcessor();
-    }
-
-    // Current camera mode name ("common", "xpan", ...). While XPAN is active
-    // the module stands down completely: every ratio/option tweak below targets
-    // the normal photo pipeline and would only confuse the self-contained XPAN
-    // mode, which is exactly what left the UI unresponsive.
-    private volatile String mCurrentMode = "";
-
-    private void hookModeTracker(final XC_LoadPackage.LoadPackageParam lp) {
-        boolean installed = false;
-        try {
-            XposedHelpers.findAndHookMethod(
-                    "com.oplus.camera.feature.arch.mvp.a0", lp.classLoader,
-                    "getCurrentModeName",
-                    new XC_MethodHook() {
-                        @Override
-                        protected void afterHookedMethod(MethodHookParam param) {
-                            Object r = param.getResult();
-                            if (r instanceof String) {
-                                mCurrentMode = (String) r;
-                            }
-                        }
-                    });
-            installed = true;
-        } catch (Throwable t) {
-            log("mode tracker: a0.getCurrentModeName FAILED: " + t);
-        }
-        try {
-            XposedHelpers.findAndHookMethod(
-                    "com.oplus.camera.entry.CameraEntry", lp.classLoader,
-                    "j",
-                    new XC_MethodHook() {
-                        @Override
-                        protected void afterHookedMethod(MethodHookParam param) {
-                            Object r = param.getResult();
-                            if (r instanceof String) {
-                                mCurrentMode = (String) r;
-                            }
-                        }
-                    });
-            installed = true;
-        } catch (Throwable t) {
-            log("mode tracker: CameraEntry.j FAILED: " + t);
-        }
-        log("mode tracker installed=" + installed);
-    }
-
-    private boolean isXpanMode() {
-        return "xpan".equals(mCurrentMode);
     }
 
     private void hookCameraConfigX(XC_LoadPackage.LoadPackageParam lp) {
@@ -612,9 +566,6 @@ public class WideCameraHook implements IXposedHookLoadPackage {
                     new XC_MethodHook() {
                         @Override
                         protected void beforeHookedMethod(MethodHookParam param) {
-                            if (isXpanMode()) {
-                                return;
-                            }
                             log("u7.o0.i0(" + Arrays.toString(param.args) + ") -> forced true");
                             param.setResult(Boolean.TRUE);
                         }
@@ -633,9 +584,6 @@ public class WideCameraHook implements IXposedHookLoadPackage {
                     new XC_MethodHook() {
                         @Override
                         protected void beforeHookedMethod(MethodHookParam param) {
-                            if (isXpanMode()) {
-                                return;
-                            }
                             String[] values = (String[]) param.args[0];
                             boolean visible = (Boolean) param.args[1];
                             log("gl.b.setOptionItemsVisible(" + Arrays.toString(values) + ", visible=" + visible + ")");
@@ -668,8 +616,7 @@ public class WideCameraHook implements IXposedHookLoadPackage {
                             }
                             log("gl.b.setOptionItems key=" + key + " size=" + size);
                             if (key != null && key.toString().contains("watermark")) {
-                                log("  wm option class=" + param.thisObject.getClass().getName()
-                                        + " xpan=" + isXpanMode());
+                                log("  wm option class=" + param.thisObject.getClass().getName());
                             }
                         }
                     });
@@ -709,9 +656,6 @@ public class WideCameraHook implements IXposedHookLoadPackage {
                     new XC_MethodHook() {
                         @Override
                         protected void beforeHookedMethod(MethodHookParam param) {
-                            if (isXpanMode()) {
-                                return;
-                            }
                             String key = (String) param.args[0];
                             String[] values = (String[]) param.args[1];
                             log("an.b.R(" + key + ", " + Arrays.toString(values) + ")");
@@ -751,12 +695,6 @@ public class WideCameraHook implements IXposedHookLoadPackage {
                         @Override
                         protected void afterHookedMethod(MethodHookParam param) {
                             try {
-                                if (param.args.length > 1 && param.args[1] instanceof String) {
-                                    mCurrentMode = (String) param.args[1];
-                                }
-                                if (isXpanMode()) {
-                                    return;
-                                }
                                 Object result = param.getResult();
                                 if (!(result instanceof String)) {
                                     return;
@@ -787,121 +725,6 @@ public class WideCameraHook implements IXposedHookLoadPackage {
             log("hooked u7.q0.b");
         } catch (Throwable t) {
             log("hook u7.q0.b FAILED: " + t);
-        }
-    }
-
-    /**
-     * XPAN (native 65:24 wide) ships inside the OPPO camera but is hidden
-     * behind the config flag "com.oplus.feature.xpan.mode.support". Force
-     * that one key to true so the mode becomes selectable in the mode list.
-     * The rest of the config surface is left untouched.
-     */
-    private void hookXpanConfigGate(final XC_LoadPackage.LoadPackageParam lp) {
-        try {
-            XposedHelpers.findAndHookMethod(
-                    "com.oplus.camera.configure.CameraConfig", lp.classLoader,
-                    "getConfigBooleanValue", String.class,
-                    new XC_MethodHook() {
-                        @Override
-                        protected void afterHookedMethod(MethodHookParam param) {
-                            try {
-                                Object k = param.args[0];
-                                if ("com.oplus.feature.xpan.mode.support".equals(k)) {
-                                    if (!Boolean.TRUE.equals(param.getResult())) {
-                                        log("xpan gate forced true (was "
-                                                + param.getResult() + ")");
-                                    }
-                                    param.setResult(Boolean.TRUE);
-                                }
-                            } catch (Throwable ignored) {}
-                        }
-                    });
-            log("hooked CameraConfig.getConfigBooleanValue (xpan gate)");
-        } catch (Throwable t) {
-            log("hook xpan gate FAILED: " + t);
-        }
-    }
-
-    /**
-     * XPAN's UI references several drawables whose layer-list XML points at
-     * sub-drawables that were stripped from this device's camera build. Loading
-     * one throws Resources$NotFoundException inside XPanExposureWheel.<init>,
-     * which unwinds XPanPresenter.onCreate and kills the activity before the
-     * mode ever reaches the HAL. Intercept the resource entry points and, for
-     * any resource whose simple name starts with "xpan", answer with a
-     * transparent drawable instead of letting the loader parse the broken XML.
-     * Everything else passes straight through untouched.
-     */
-    private void hookXpanDrawableFallback(final XC_LoadPackage.LoadPackageParam lp) {
-        try {
-            XposedHelpers.findAndHookMethod(
-                    "android.content.res.Resources", lp.classLoader, "getDrawableForDensity",
-                    int.class, int.class, android.content.res.Resources.Theme.class,
-                    new XC_MethodHook() {
-                        @Override
-                        protected void beforeHookedMethod(MethodHookParam param) {
-                            android.graphics.drawable.Drawable d =
-                                    xpanFallback(param.thisObject, (Integer) param.args[0]);
-                            if (d != null) {
-                                param.setResult(d);
-                            }
-                        }
-                    });
-            log("hooked Resources.getDrawableForDensity (xpan bypass)");
-        } catch (Throwable t) {
-            log("hook getDrawableForDensity FAILED: " + t);
-        }
-        try {
-            XposedHelpers.findAndHookMethod(
-                    "android.content.res.Resources", lp.classLoader, "loadDrawable",
-                    android.util.TypedValue.class, int.class, int.class,
-                    android.content.res.Resources.Theme.class,
-                    new XC_MethodHook() {
-                        @Override
-                        protected void beforeHookedMethod(MethodHookParam param) {
-                            android.graphics.drawable.Drawable d =
-                                    xpanFallback(param.thisObject, (Integer) param.args[1]);
-                            if (d != null) {
-                                param.setResult(d);
-                            }
-                        }
-                    });
-            log("hooked Resources.loadDrawable (xpan bypass)");
-        } catch (Throwable t) {
-            log("hook loadDrawable FAILED: " + t);
-        }
-    }
-
-    /**
-     * Returns a transparent placeholder for xpan* drawables, or null when the
-     * resource is not part of the XPAN family and must be loaded normally.
-     */
-    /**
-     * Only these drawables are known to have broken layer-list XML on this
-     * build. Everything else named xpan_* loads normally, so the mode picker
-     * still gets real, correctly-sized icons.
-     */
-    private static final java.util.Set<String> XPAN_BROKEN_DRAWABLES =
-            new java.util.HashSet<>(java.util.Arrays.asList(
-                    "xpan_triangle_indicator_with_shadow"));
-
-    private android.graphics.drawable.Drawable xpanFallback(Object resObj, int id) {
-        try {
-            android.content.res.Resources res = (android.content.res.Resources) resObj;
-            String name = res.getResourceName(id);
-            if (name == null) {
-                return null;
-            }
-            String simple = name.substring(name.lastIndexOf('/') + 1);
-            if (!XPAN_BROKEN_DRAWABLES.contains(simple)) {
-                return null;
-            }
-            log("xpan drawable bypassed: " + name + " (0x" + Integer.toHexString(id) + ")");
-            android.graphics.Bitmap bmp = android.graphics.Bitmap.createBitmap(
-                    1, 1, android.graphics.Bitmap.Config.ARGB_8888);
-            return new android.graphics.drawable.BitmapDrawable(res, bmp);
-        } catch (Throwable t) {
-            return null;
         }
     }
 
@@ -1950,6 +1773,181 @@ public class WideCameraHook implements IXposedHookLoadPackage {
      * the ratio getter reported a transient non-wide value on the next pass;
      * once a path is marked, it stays marked until it is confirmed cropped.
      */
+    /**
+     * HEIF ("高效图片存储") is encoded natively, so a wide HEIC lands
+     * full-frame and none of the JPEG crop hooks ever see it. Decode it here,
+     * centre-crop to 65:24, and write the result as a plain JPEG beside it —
+     * the same format the rest of this pipeline already crops and notifies.
+     * The original HEIC is removed and both paths are re-scanned, so the
+     * gallery shows the cropped frame instead of the full one.
+     */
+    private void cropHeicToJpeg(java.io.File f) {
+        try {
+            android.graphics.Bitmap src =
+                    android.graphics.BitmapFactory.decodeFile(f.getAbsolutePath());
+            if (src == null) {
+                log("heic decode null " + f.getName());
+                return;
+            }
+            int w = src.getWidth();
+            int h = src.getHeight();
+            int[] crop = centredWideCrop(w, h);
+            if (crop == null) {
+                src.recycle();
+                return;
+            }
+            android.graphics.Bitmap cropped = android.graphics.Bitmap.createBitmap(
+                    src, crop[0], crop[1], crop[2], crop[3]);
+            String base = f.getName();
+            int dot = base.lastIndexOf('.');
+            if (dot > 0) {
+                base = base.substring(0, dot);
+            }
+            java.io.File out = new java.io.File(f.getParentFile(), base + ".jpg");
+            java.io.FileOutputStream fos = new java.io.FileOutputStream(out);
+            cropped.compress(android.graphics.Bitmap.CompressFormat.JPEG, 95, fos);
+            fos.flush();
+            fos.close();
+            // The stored HEIC is orientation-tagged rather than pre-rotated, so
+            // carry that tag across or the cropped wide frame reads back
+            // upright-as-stored instead of as the wide band the user framed.
+            // The capture clock matters just as much: MediaStore derives
+            // DATE_TAKEN from DateTimeOriginal and the camera's "jump to the
+            // latest shot" sorts on it, so a JPEG that only carries the
+            // orientation tag lands in the wrong slot and the gallery opens
+            // on some older frame.
+            // Carry the whole EXIF block across, not just the clock: the
+            // gallery's detail sheet reads aperture / shutter / ISO / focal
+            // length from these tags, so a wide frame that keeps only
+            // Make/Model ends up showing the model and blanking the rest.
+            // Standard EXIF tag names, written as plain strings on purpose:
+            // the ExifInterface.TAG_* constants for the newer fields only
+            // exist on recent SDK levels and would not compile against this
+            // project's compileSdk. These names are what getAttribute /
+            // setAttribute accept either way.
+            String[] exifTags = new String[]{
+                    "Orientation",
+                    "DateTime",
+                    "DateTimeOriginal",
+                    "DateTimeDigitized",
+                    "OffsetTimeOriginal",
+                    "Make",
+                    "Model",
+                    "LensMake",
+                    "LensModel",
+                    "LensSerialNumber",
+                    "BodySerialNumber",
+                    "FNumber",
+                    "ApertureValue",
+                    "ExposureTime",
+                    "ShutterSpeedValue",
+                    "ISOSpeedRatings",
+                    "FocalLength",
+                    "FocalLengthIn35mmFilm",
+                    "WhiteBalance",
+                    "Flash",
+                    "ExposureBiasValue",
+                    "MeteringMode",
+                    "SceneCaptureType",
+                    "ExposureProgram",
+                    "ImageUniqueID",
+                    "Software",
+            };
+            String[] exifVals = new String[exifTags.length];
+            try {
+                android.media.ExifInterface in =
+                        new android.media.ExifInterface(f.getAbsolutePath());
+                for (int i = 0; i < exifTags.length; i++) {
+                    try {
+                        exifVals[i] = in.getAttribute(exifTags[i]);
+                    } catch (Throwable ig) {
+                    }
+                }
+            } catch (Throwable ignored) {
+            }
+            int got = 0;
+            for (int i = 0; i < exifVals.length; i++) {
+                if (exifVals[i] != null) {
+                    got++;
+                }
+            }
+            log("heic exif carry " + got + "/" + exifTags.length
+                    + " " + f.getName());
+            // ExifInterface does not always surface the capture clock for HEIF,
+            // but the OPPO file name carries it (IMGyyyyMMddHHmmss). Fall back
+            // to that so DATE_TAKEN is never left empty and the fresh frame
+            // still sorts as the newest shot.
+            if (exifVals[2] == null) {
+                java.util.regex.Matcher m = java.util.regex.Pattern
+                        .compile("img(\\d{4})(\\d{2})(\\d{2})(\\d{2})(\\d{2})(\\d{2})")
+                        .matcher(base.toLowerCase());
+                if (m.find()) {
+                    String stamp = m.group(1) + ":" + m.group(2) + ":" + m.group(3)
+                            + " " + m.group(4) + ":" + m.group(5) + ":" + m.group(6);
+                    exifVals[1] = stamp;
+                    exifVals[2] = stamp;
+                    exifVals[3] = stamp;
+                }
+            }
+            try {
+                android.media.ExifInterface oe =
+                        new android.media.ExifInterface(out.getAbsolutePath());
+                for (int i = 0; i < exifTags.length; i++) {
+                    if (exifVals[i] == null) {
+                        continue;
+                    }
+                    try {
+                        oe.setAttribute(exifTags[i], exifVals[i]);
+                    } catch (Throwable ig) {
+                    }
+                }
+                oe.saveAttributes();
+            } catch (Throwable ignored) {
+            }
+            // Keep the file's own clock at the capture instant so DATE_ADDED /
+            // DATE_MODIFIED agree with the rest of the burst instead of
+            // reading as "just now" and falling out of order.
+            long origMtime = f.lastModified();
+            out.setLastModified(origMtime);
+            boolean del = f.delete();
+            log("post-proc heic->jpg " + f.getName() + " " + w + "x" + h
+                    + " -> " + crop[2] + "x" + crop[3]
+                    + " ori=" + exifVals[0] + " del=" + del
+                    + " size=" + out.length());
+            notifyMedia(out, f);
+            src.recycle();
+            cropped.recycle();
+        } catch (Throwable t) {
+            log("post-proc heic->jpg error: " + t);
+        }
+    }
+
+    /**
+     * Hand the freshly written JPEG to the media scanner and point it at the
+     * HEIC that was replaced: scanning a path that no longer exists is how the
+     * MediaStore row for the old frame gets cleared.
+     */
+    private void notifyMedia(java.io.File added, java.io.File removed) {
+        try {
+            Object ctx = getAppContext();
+            if (!(ctx instanceof android.content.Context)) {
+                return;
+            }
+            java.util.ArrayList<String> paths = new java.util.ArrayList<String>();
+            if (added != null) {
+                paths.add(added.getAbsolutePath());
+            }
+            if (removed != null) {
+                paths.add(removed.getAbsolutePath());
+            }
+            android.media.MediaScannerConnection.scanFile(
+                    (android.content.Context) ctx,
+                    paths.toArray(new String[0]), null, null);
+        } catch (Throwable t) {
+            log("heic scan error: " + t);
+        }
+    }
+
     private void startPostProcessor() {
         if (mPostProcStarted) return;
         mPostProcStarted = true;
@@ -1988,12 +1986,13 @@ public class WideCameraHook implements IXposedHookLoadPackage {
                         for (java.io.File f : fs) {
                             try {
                                 String n = f.getName().toLowerCase();
-                                if (!(n.endsWith(".jpg") || n.endsWith(".jpeg"))) continue;
+                                boolean heic = n.endsWith(".heic") || n.endsWith(".heif");
+                                if (!(n.endsWith(".jpg") || n.endsWith(".jpeg") || heic)) continue;
                                 // Whitelist: only touch photos produced by OPPO Camera itself
                                 // (IMG + 14-digit timestamp). Third-party apps (watermark
                                 // cameras, GCam, etc.) drop differently-named files into the
                                 // same folders and must NOT be cropped by us.
-                                if (!n.matches("img\\d{14}(_\\d+)?\\.(jpg|jpeg)")) continue;
+                                if (!n.matches("img\\d{14}(_\\d+)?\\.(jpg|jpeg|heic|heif)")) continue;
                                 long len = f.length();
                                 if (len < 300000) continue;
                                 long mt = f.lastModified();
@@ -2037,6 +2036,15 @@ public class WideCameraHook implements IXposedHookLoadPackage {
                                 }
                                 mCropSeen.put(path, sig);
                                 if (fileMatchesTarget(f)) {
+                                    continue;
+                                }
+                                if (heic) {
+                                    // HEIF rides a native encoder that never
+                                    // touches the JPEG crop hooks, so the only
+                                    // place left to fix it is here: decode,
+                                    // centre-crop, and re-emit as the JPEG this
+                                    // pipeline already knows how to handle.
+                                    cropHeicToJpeg(f);
                                     continue;
                                 }
                                 cropFileInPlace(f);
@@ -2115,9 +2123,9 @@ public class WideCameraHook implements IXposedHookLoadPackage {
     }
 
     /**
-     * Post-capture 65:24 crop. The device HAL exposes no native 65:24 output
-     * and the XPAN preview-key injection was ignored, so the only reliable
-     * path left is to crop the final JPEG right before it is encoded. We hook
+     * Post-capture 65:24 crop. The device HAL exposes no native 65:24 output,
+     * so the only reliable path left is to crop the final JPEG right before
+     * it is encoded. We hook
      * Bitmap.compress inside the camera process and, while "wide" is selected,
      * swap the source bitmap for a centre-cropped 65:24 one.
      */
@@ -2167,6 +2175,145 @@ public class WideCameraHook implements IXposedHookLoadPackage {
             log("hooked Bitmap.compress (65:24 crop)");
         } catch (Throwable t) {
             log("hook Bitmap.compress FAILED: " + t);
+        }
+    }
+
+    /**
+     * HEIF ("高效图片存储") bypasses every JPEG crop hook: the camera hands the
+     * raw frame to com.oplus.media.OplusHeifWriter, which does the HEVC encode
+     * itself. This hook only observes that path for now - it records the
+     * encoder's declared size and logs the pixel buffer length so the crop can
+     * be added once the exact layout (RGBA vs YUV, dims) is confirmed. Guessing
+     * wrong would corrupt the saved frame, so this first build observes only.
+     */
+    private void hookOplusHeifWriter(final XC_LoadPackage.LoadPackageParam lp) {
+        try {
+            XposedHelpers.findAndHookMethod(
+                    "com.oplus.media.OplusHeifWriter", lp.classLoader,
+                    "createPrimaryImage",
+                    int.class, int.class, int.class, int.class,
+                    int.class, int.class, int.class,
+                    new XC_MethodHook() {
+                        @Override
+                        protected void beforeHookedMethod(MethodHookParam param) {
+                            try {
+                                int w = (Integer) param.args[0];
+                                int h = (Integer) param.args[1];
+                                sHeifDims.put(System.identityHashCode(param.thisObject),
+                                        new int[]{w, h});
+                                log("heif createPrimaryImage w=" + w + " h=" + h
+                                        + " a2=" + param.args[2] + " a3=" + param.args[3]
+                                        + " a4=" + param.args[4] + " a5=" + param.args[5]
+                                        + " a6=" + param.args[6] + " wide=" + mWideActive);
+                            } catch (Throwable t) {
+                                log("heif createPrimaryImage hook error: " + t);
+                            }
+                        }
+                    });
+            log("hooked OplusHeifWriter.createPrimaryImage");
+        } catch (Throwable t) {
+            log("hook OplusHeifWriter.createPrimaryImage FAILED: " + t);
+        }
+        try {
+            XposedHelpers.findAndHookMethod(
+                    "com.oplus.media.OplusHeifWriter", lp.classLoader,
+                    "processPrimaryImage",
+                    byte[].class, byte[].class, java.io.FileDescriptor.class,
+                    new XC_MethodHook() {
+                        @Override
+                        protected void beforeHookedMethod(MethodHookParam param) {
+                            try {
+                                byte[] px = (byte[]) param.args[0];
+                                byte[] exif = (byte[]) param.args[1];
+                                int len = (px == null) ? -1 : px.length;
+                                int[] wh = sHeifDims.get(
+                                        System.identityHashCode(param.thisObject));
+                                String dims = (wh == null) ? "?" : (wh[0] + "x" + wh[1]);
+                                long rgba = (wh == null) ? -1L : (long) wh[0] * wh[1] * 4L;
+                                log("heif processPrimaryImage len=" + len
+                                        + " exifLen=" + (exif == null ? -1 : exif.length)
+                                        + " dims=" + dims + " rgba=" + rgba
+                                        + " wide=" + mWideActive);
+                            } catch (Throwable t) {
+                                log("heif processPrimaryImage hook error: " + t);
+                            }
+                        }
+                    });
+            log("hooked OplusHeifWriter.processPrimaryImage");
+        } catch (Throwable t) {
+            log("hook OplusHeifWriter.processPrimaryImage FAILED: " + t);
+        }
+    }
+
+    /**
+     * "高效图片存储" (HEIF) hands the frame to a native HEVC encoder that never
+     * passes through any of the JPEG crop hooks, so a wide HEIC ships
+     * full-frame. Re-encoding HEVC in-process is not worth the risk, so instead
+     * answer the picture pipeline's HEIF-format read with "off" while the wide
+     * band is active: wide shots then take the ordinary JPEG path the crop hooks
+     * already cover, and every other ratio keeps following the user's setting.
+     */
+    private void hookHeifFormatSwitch(final XC_LoadPackage.LoadPackageParam lp) {
+        try {
+            Class<?> dataKeyClass = lp.classLoader.loadClass("com.oplus.camera.data.DataKey");
+            XposedHelpers.findAndHookMethod(
+                    "com.oplus.camera.data.DataManager", lp.classLoader,
+                    "b", dataKeyClass, Object.class,
+                    new XC_MethodHook() {
+                        @Override
+                        protected void afterHookedMethod(MethodHookParam param) {
+                            heifGate(param, "b", lp);
+                        }
+                    });
+            XposedHelpers.findAndHookMethod(
+                    "com.oplus.camera.data.DataManager", lp.classLoader,
+                    "c", dataKeyClass,
+                    new XC_MethodHook() {
+                        @Override
+                        protected void afterHookedMethod(MethodHookParam param) {
+                            heifGate(param, "c", lp);
+                        }
+                    });
+            log("hooked DataManager heif-format gate");
+        } catch (Throwable t) {
+            log("hook DataManager heif-format FAILED: " + t);
+        }
+    }
+
+    /**
+     * Shared body for both DataManager readers. Only the HEIF-format keys are
+     * touched, and only while the wide band is active; the replacement is
+     * coerced to whatever type the camera's own read declared.
+     */
+    private void heifGate(XC_MethodHook.MethodHookParam param, String which,
+                          XC_LoadPackage.LoadPackageParam lp) {
+        try {
+            Object key = param.args[0];
+            if (key == null) {
+                return;
+            }
+            String hit = null;
+            for (String n : keyFields(key)) {
+                if (n != null && n.contains("heif_format")) {
+                    hit = n;
+                    break;
+                }
+            }
+            if (hit == null) {
+                return;
+            }
+            Object cur = param.getResult();
+            boolean wide = mWideActive || isWideSelected(lp);
+            log("heif fmt probe " + which + " " + hit + " wide=" + wide + " val=" + cur);
+            if (!wide) {
+                return;
+            }
+            Object off = (cur instanceof String) ? "jpeg"
+                    : (cur instanceof Integer) ? Integer.valueOf(0)
+                    : Boolean.FALSE;
+            param.setResult(off);
+            log("heif fmt forced jpeg (was " + cur + ")");
+        } catch (Throwable ignored) {
         }
     }
 

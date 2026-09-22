@@ -1,99 +1,61 @@
 # WideFormat+
 
-【自用模块】利用AI给 Realme GT8Pro 相机（6.070.172）增加 65:24 宽幅的 LSPosed 模块。测试系统：16.0.9.402 相机版本：6.070.172
+【自用模块】用AI给 Realme GT8Pro 相机（6.070.172）增加 65:24 宽幅 · 适配 RMX5200 / RealmeUI 16.0.9.402 / Android 16
 
-以下为AI编写的内容：
+==================================================
 
-> 适配基线：RMX5200 · OplusCamera 6.070.172（versionCode 60000）· ColorOS V16.1.0 · Android 16
+WideFormat+介绍
 
-## 目录结构
+给相机添加 65:24 XPAN宽画幅（非官方实现方式）
 
-```
-lsposed_wide/
-├── settings.gradle.kts
-├── build.gradle.kts
-├── gradle.properties
-├── app/
-│   ├── build.gradle.kts
-│   └── src/main/
-│       ├── AndroidManifest.xml
-│       ├── assets/xposed_init
-│       ├── java/com/wideformat/plus/WideCameraHook.java
-│       └── res/values/arrays.xml
-└── README.md
-```
+选择宽幅后：
+- 取景框按 65:24 两边加黑边，取景时看到的就是最终成片的构图；
+- 拍出来的照片自动居中裁成 65:24比例
+- 照片不带水印
 
-## 目标与作用域
+其余画幅（4:3、1:1、16:9 全屏 等）不受任何影响
 
-- 目标包名：`com.oplus.camera`
-- 入口类：`com.wideformat.plus.WideCameraHook`
-- Xposed 最低版本：82
+--------------------------------------------------
 
-## Hook 点
+宽幅是怎么实现的
 
-模块同时做「诊断」和「强制」两件事，全部写进 Xposed 日志（TAG = `WideCamera`）：
+相机本身没有 65:24 这个比例，底层也不支持直接输出 65:24。所以模块采用「把成片加工裁成宽幅，曲线救国」的路线
 
-| # | 类.方法 | 处理 |
-|---|---|---|
-| 1 | `com.oplus.camera.configure.CameraConfig.x(String,String)Z` | 当第二个参数是 `com.oplus.camera.wide.frame.ratio.support.modelist` 时强制返回 `true` |
-| 2 | `u7.o0.i0(String,ZZ)Z` | 恒返回 `true`（绕过 `wa.d.l1()` 里那条隐藏 wide 的分支） |
-| 3 | `gl.b.setOptionItemsVisible(String[],boolean)V` | 当 values 含 `wide` 且 visible=false 时，改成 `true` |
-| 4 | `gl.b.setOptionItems(ArrayList)V` | 只记录 key 与条目数 |
-| 5 | `gn.n.J(String,String[])Z` | 记录调用与返回值 |
-| 6 | `an.b.R(String,String[])V` | 当 key 是 `pref_camera_photo_ratio_key` 且 values 含 `wide` 时直接拦截返回（阻止隐藏） |
+一、让画幅选项出现「宽幅」
+相机内置了一份「哪些模式支持宽幅」的配置，默认把这一项藏起来。模块在相机读取这份配置、以及决定选项是否可见时把它放开，画幅选项即出现宽幅。
 
-因为 v1–v4 静态改 APK 都没让宽幅出现，说明门控点还没完全定位。这套 hook 的价值是：**装上后跑一次相机，看 LSPosed 日志里到底哪条链被触发**，日志会直接告诉我们 wide 是在哪一步被过滤掉的。
+二、取景框按 65:24 取景
+预览画面本身仍是相机输出的 4:3，相机把它放大居中裁切填满了全屏。模块不缩放预览，选择在两侧盖上黑条，把可见范围收成一条 24:65 的竖带——横过来看就是 65:24 的宽幅。此举使得取景框与成片一致，所见即所得
 
-## 构建
+三、成片居中裁成 65:24
+相机拍完写盘时，模块在写文件的环节把照片居中裁成 65:24。裁剪会保留相机写入的 EXIF、Ultra HDR 增益图和 XMP / MPF 声明，画质和动态范围不受影响
 
-### 方式 A：AndroidIDE / 本机 Gradle
+四、兜底
+万一某张照片绕过了上面的写盘环节，后台还有一个线程扫相册目录，将漏裁的宽幅照片补裁
 
-1. 首次需要生成 wrapper（若项目里没有 `gradlew`）：
+此线程平时不扫盘，只在检测到宽幅拍摄信号后 60 秒窗口内才开始 list 目录。窗口一过就回到“每 3 秒一次纯内存判断”的休眠态；线程随相机进程生死，没有独立服务、没有 wakelock。代价是一个常驻 daemon 和每 3 秒一次微秒级唤醒，可得到漏裁照片自动补裁的好处
 
-   ```bash
-   cd /data/data/com.ai.assistance.operit/files/workspace/相机宽幅/lsposed_wide
-   gradle wrapper --gradle-version 8.4
-   ```
+--------------------------------------------------
 
-2. 编译 debug 包：
+Q：为什么宽幅照片没有水印
 
-   ```bash
-   ./gradlew :app:assembleDebug
-   ```
+A：相机的机型水印是在成片之后、由相册那条链加上去的，它会读照片里的水印开关；宽幅模式下，模块在相机读这个开关时回答「关」，所以宽幅照片不会带水印。
 
-3. 产物：
+解释：若是带水印，带有水印的图片被裁剪，使水印变得不和谐且无法编辑（例如去除水印），故模块将宽幅拍摄时相机水印设置为“关”。后续仍可在相册自行添加水印
 
-   ```
-   app/build/outputs/apk/debug/app-debug.apk
-   ```
+此改动仅对宽幅生效，在其他画幅时，相机水印设置界面开关状态将遵循用户设置
 
-### 方式 B：直接用 Android Studio
+--------------------------------------------------
 
-用 Android Studio 打开 `lsposed_wide/` 目录，Sync 后 `Build > Build APK(s)`。
+Q：为什么高效图片存储对宽幅无效
 
-> 依赖 `de.robv.android.xposed:api:82` 只做 `compileOnly`，运行期由 LSPosed 框架提供，不要打包进 APK。
+A：相机设置里的「高效图片存储」会让照片以 HEIC 格式保存，打开它之后，普通画幅的照片是 HEIC，但宽幅照片仍然是 JPEG。
 
-## 安装与验证
+原因是两条落盘路径不一样：
 
-1. 安装 `app-debug.apk`。
-2. 打开 LSPosed 管理器 → 模块 → 启用 `WideFormat+`。
-3. 在模块作用域里勾选 **相机（com.oplus.camera）**。
-4. 强制停止相机（或重启一次），打开相机 → 切到照片模式 → 看比例条。
-5. 抓日志：
+- 普通画幅的照片，相机是在 Java 层把像素交给编码器写盘的，模块可以在这一层把它裁成 65:24；
+- HEIC 是由相机自己的底层编码器直接写盘的，模块拿不到那一步的像素，也就没法在编码前裁剪
 
-   ```bash
-   logcat -s LSPosed-Bridge | grep WideCamera
-   ```
+所以模块换了个位置下手：等 HEIC 文件落盘之后，把它读出来、居中裁成 65:24，再以同名 JPEG 重新写回。同时把方向、拍摄时间、光圈、快门、ISO、焦距、镜头这些参数一并搬过去，原 HEIC 删除
 
-   或者在 LSPosed 管理器里直接看模块日志。
-
-## 日志怎么读
-
-- 如果看到 `u7.o0.i0(...) -> forced true` 但宽幅仍不出现 → 说明比例菜单不走 `wa.d` 这条链，需要继续找真正的菜单数据源。
-- 如果看到 `gl.b.setOptionItemsVisible([...wide...], visible=false)` → 就是这里被隐藏的，第 3 条 hook 应该能救回来；如果没救回来，说明还有别的地方在过滤。
-- 如果看到 `an.b.R(pref_camera_photo_ratio_key, [...wide...])` → 说明 `w3` 确实在隐藏 wide，第 6 条已拦截。
-- 如果以上日志**一条都没有** → 说明相机进程没有被 hook 上（检查作用域/是否重启过相机进程），或者这些类名在运行期被 dex 优化改名了。
-
-## 后续
-
-把首次运行的 LSPosed 日志发出来，就能精确定位真正过滤 wide 的那一行，然后把这个模块收敛成只有一两处精准 hook 的成品。
+结果是宽幅照片变成了 JPEG。这是为了保住裁剪而做的取舍——如果不换格式，宽幅在开启高效图片存储时就只能保持全画幅、不裁剪（不如自己全屏拍照后去相册裁成XPAN比例）
