@@ -2,9 +2,7 @@
 
 【自用模块】给 Realme GT8Pro 相机（6.070.172）增加 65:24 宽幅的 LSPosed 模块。
 
-> 适配基线：Realme GT8Pro · OplusCamera 6.070.172（versionCode 60000）· ColorOS V16.1.0 · Android 16
-
-相比 Hybrid-Mount 换 APK 的方案，LSPosed 模块在运行时 hook，不需要替换系统 APK、不需要频繁重启，改一行重新装即可。
+> 适配基线：RMX5200 · OplusCamera 6.070.172（versionCode 60000）· ColorOS V16.1.0 · Android 16
 
 ## 目录结构
 
