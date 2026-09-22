@@ -2,7 +2,7 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
 
     <application
-        android:label="WideCamera Enabler"
+        android:label="Camera Wide Format"
         android:icon="@android:drawable/ic_menu_camera"
         android:allowBackup="false"
         android:supportsRtl="true">
@@ -12,7 +12,7 @@
             android:value="true" />
         <meta-data
             android:name="xposeddescription"
-            android:value="解锁 OPPO 相机 65:24 宽幅比例入口" />
+            android:value="为 OPPO 系统相机解锁 65:24 宽幅比例：预览与成片、去水印、Ultra HDR 保留" />
         <meta-data
             android:name="xposedminversion"
             android:value="82" />

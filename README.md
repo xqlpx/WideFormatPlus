@@ -1,6 +1,6 @@
-# WideCamera Enabler (LSPosed)
+# Camera Wide Format (LSPosed)
 
-解锁 OPPO 相机 65:24「宽幅」拍照比例入口的 LSPosed 模块。
+把 OPPO 系统相机拍成 65:24 电影宽幅 —— 预览、成片、去水印，Ultra HDR 完整保留。
 
 相比 Hybrid-Mount 换 APK 的方案，LSPosed 模块在运行时 hook，不需要替换系统 APK、不需要频繁重启，改一行重新装即可。
 
@@ -74,7 +74,7 @@ lsposed_wide/
 ## 安装与验证
 
 1. 安装 `app-debug.apk`。
-2. 打开 LSPosed 管理器 → 模块 → 启用 `WideCamera Enabler`。
+2. 打开 LSPosed 管理器 → 模块 → 启用 `Camera Wide Format`。
 3. 在模块作用域里勾选 **相机（com.oplus.camera）**。
 4. 强制停止相机（或重启一次），打开相机 → 切到照片模式 → 看比例条。
 5. 抓日志：
