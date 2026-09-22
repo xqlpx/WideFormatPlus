@@ -1,4 +1,4 @@
-package com.camerawideformat;
+package com.wideformat.plus;
 
 import java.util.Arrays;
 

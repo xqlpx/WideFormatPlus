@@ -3,11 +3,11 @@ plugins {
 }
 
 android {
-    namespace = "com.camerawideformat"
+    namespace = "com.wideformat.plus"
     compileSdk = 35
 
     defaultConfig {
-        applicationId = "com.camerawideformat"
+        applicationId = "com.wideformat.plus"
         minSdk = 24
         targetSdk = 35
         versionCode = 1

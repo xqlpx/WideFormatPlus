@@ -1,6 +1,8 @@
-# Camera Wide Format (LSPosed)
+# WideFormat+
 
-把 OPPO 系统相机拍成 65:24 电影宽幅 —— 预览、成片、去水印，Ultra HDR 完整保留。
+给 ColorOS 系 OplusCamera 增加 65:24 电影宽幅画幅的 LSPosed 模块。
+
+> 适配基线：OplusCamera 6.070.172（versionCode 60000）· ColorOS V16.1.0 · RMX5200 · Android 16
 
 相比 Hybrid-Mount 换 APK 的方案，LSPosed 模块在运行时 hook，不需要替换系统 APK、不需要频繁重启，改一行重新装即可。
 
@@ -16,7 +18,7 @@ lsposed_wide/
 │   └── src/main/
 │       ├── AndroidManifest.xml
 │       ├── assets/xposed_init
-│       ├── java/com/camerawideformat/WideCameraHook.java
+│       ├── java/com/wideformat/plus/WideCameraHook.java
 │       └── res/values/arrays.xml
 └── README.md
 ```
@@ -24,7 +26,7 @@ lsposed_wide/
 ## 目标与作用域
 
 - 目标包名：`com.oplus.camera`
-- 入口类：`com.camerawideformat.WideCameraHook`
+- 入口类：`com.wideformat.plus.WideCameraHook`
 - Xposed 最低版本：82
 
 ## Hook 点
@@ -74,7 +76,7 @@ lsposed_wide/
 ## 安装与验证
 
 1. 安装 `app-debug.apk`。
-2. 打开 LSPosed 管理器 → 模块 → 启用 `Camera Wide Format`。
+2. 打开 LSPosed 管理器 → 模块 → 启用 `WideFormat+`。
 3. 在模块作用域里勾选 **相机（com.oplus.camera）**。
 4. 强制停止相机（或重启一次），打开相机 → 切到照片模式 → 看比例条。
 5. 抓日志：
