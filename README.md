@@ -1,6 +1,8 @@
 # WideFormat+
 
-【自用模块】给 Realme GT8Pro 相机（6.070.172）增加 65:24 宽幅的 LSPosed 模块。
+【自用模块】利用AI给 Realme GT8Pro 相机（6.070.172）增加 65:24 宽幅的 LSPosed 模块。测试系统：16.0.9.402 相机版本：6.070.172
+
+以下为AI编写的内容：
 
 > 适配基线：RMX5200 · OplusCamera 6.070.172（versionCode 60000）· ColorOS V16.1.0 · Android 16
 
