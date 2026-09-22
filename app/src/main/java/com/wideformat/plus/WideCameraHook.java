@@ -426,6 +426,17 @@ public class WideCameraHook implements IXposedHookLoadPackage {
                     "onAttachedToWindow", new XC_MethodHook() {
                         @Override
                         protected void afterHookedMethod(MethodHookParam param) {
+                            // A fresh camera session begins here. mWideActive is an
+                            // instance field and the camera process stays cached
+                            // long after the app is closed, so it can still hold
+                            // "wide" from the previous session. The ratio getter
+                            // only clears it once the camera actually reads the
+                            // ratio back (a few seconds in), which is exactly why a
+                            // 4:3 shot taken right after open was being cropped.
+                            // Start every session as non-wide; a genuine wide read
+                            // re-arms it in hookRatioGetter.
+                            mWideActive = false;
+                            mWideLastSeenAt = 0L;
                             mGlRootView = new java.lang.ref.WeakReference<android.view.SurfaceView>(
                                     (android.view.SurfaceView) param.thisObject);
                             log("preview crop: captured GLRootView");
