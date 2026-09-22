@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- LSPosed 作用域：只注入 OPPO 相机进程 -->
+    <string-array name="xposed_scope">
+        <item>com.oplus.camera</item>
+    </string-array>
+</resources>

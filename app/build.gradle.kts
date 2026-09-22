@@ -1,0 +1,38 @@
+plugins {
+    id("com.android.application")
+}
+
+android {
+    namespace = "com.camerawideformat"
+    compileSdk = 35
+
+    defaultConfig {
+        applicationId = "com.camerawideformat"
+        minSdk = 24
+        targetSdk = 35
+        versionCode = 1
+        versionName = "1.0"
+    }
+
+    buildTypes {
+        release {
+            isMinifyEnabled = false
+        }
+    }
+
+    compileOptions {
+        sourceCompatibility = JavaVersion.VERSION_17
+        targetCompatibility = JavaVersion.VERSION_17
+    }
+
+    packaging {
+        resources {
+            excludes += "/META-INF/*"
+        }
+    }
+}
+
+dependencies {
+    // Xposed API：用本仓库的离线 stub 做 compileOnly，运行期由 LSPosed 框架注入真实实现
+    compileOnly(project(":xposed-stub"))
+}
