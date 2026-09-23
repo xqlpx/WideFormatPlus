@@ -59,10 +59,6 @@ public class WideCameraHook implements IXposedHookLoadPackage {
     private volatile boolean mWideActive = false;
     private volatile long mLoadTime = 0L;
     private volatile boolean mPostProcStarted = false;
-    // Encoder-declared size per OplusHeifWriter instance, so the HEIF pixel
-    // buffer can be matched to a layout at processPrimaryImage time.
-    private final java.util.Map<Integer, int[]> sHeifDims =
-            new java.util.concurrent.ConcurrentHashMap<Integer, int[]>();
     private final java.util.Map<String, Long> mLastSize =
             new java.util.concurrent.ConcurrentHashMap<String, Long>();
 
@@ -348,23 +344,6 @@ public class WideCameraHook implements IXposedHookLoadPackage {
                                 if (key == null) {
                                     return;
                                 }
-                                String name = keyFields(key)[0];
-                                if (name != null && name.contains("watermark")) {
-                                    log("wm probe b " + name + " wide=" + mWideActive
-                                            + " val=" + param.getResult());
-                                    if (mWideActive || isWideSelected(lp)) {
-                                        StringBuilder st = new StringBuilder();
-                                        try {
-                                            StackTraceElement[] tr = Thread.currentThread().getStackTrace();
-                                            for (int si = 0; si < tr.length && si < 12; si++) {
-                                                st.append(tr[si].getClassName()).append('#')
-                                                        .append(tr[si].getMethodName()).append(' ');
-                                            }
-                                        } catch (Throwable ignored3) {
-                                        }
-                                        log("wm caller b " + name + ": " + st);
-                                    }
-                                }
                                 if (!isWatermarkKey(key)) {
                                     return;
                                 }
@@ -387,23 +366,6 @@ public class WideCameraHook implements IXposedHookLoadPackage {
                                 Object key = param.args[0];
                                 if (key == null) {
                                     return;
-                                }
-                                String name = keyFields(key)[0];
-                                if (name != null && name.contains("watermark")) {
-                                    log("wm probe c " + name + " wide=" + mWideActive
-                                            + " val=" + param.getResult());
-                                    if (mWideActive || isWideSelected(lp)) {
-                                        StringBuilder st = new StringBuilder();
-                                        try {
-                                            StackTraceElement[] tr = Thread.currentThread().getStackTrace();
-                                            for (int si = 0; si < tr.length && si < 12; si++) {
-                                                st.append(tr[si].getClassName()).append('#')
-                                                        .append(tr[si].getMethodName()).append(' ');
-                                            }
-                                        } catch (Throwable ignored3) {
-                                        }
-                                        log("wm caller c " + name + ": " + st);
-                                    }
                                 }
                                 if (!isWatermarkKey(key)) {
                                     return;
@@ -530,8 +492,6 @@ public class WideCameraHook implements IXposedHookLoadPackage {
         hookFileOutputStreamWrite(lpparam);
         hookFileChannelWrite(lpparam);
         hookKcM1G(lpparam);
-        hookOplusHeifWriter(lpparam);
-        hookHeifFormatSwitch(lpparam);
         hookPreviewCrop(lpparam);
         hookWatermarkSwitch(lpparam);
         startPostProcessor();
@@ -1948,6 +1908,402 @@ public class WideCameraHook implements IXposedHookLoadPackage {
         }
     }
 
+    /** Read a fixed slice of the file; returns null on any failure. */
+    private static byte[] readAt(java.io.RandomAccessFile raf, long off, int len) {
+        try {
+            if (off < 0 || len <= 0) {
+                return null;
+            }
+            byte[] b = new byte[len];
+            raf.seek(off);
+            raf.readFully(b);
+            return b;
+        } catch (Throwable t) {
+            return null;
+        }
+    }
+
+    /**
+     * RAW / RAW MAX saves a DNG, and raw data cannot be re-cropped pixel by
+     * pixel. But a DNG already carries the standard crop tags DefaultCropOrigin
+     * / DefaultCropSize (RATIONAL x2, inside the SubIFD) that viewers honour.
+     * While wide is active we rewrite just those two tags to a centred 65:24
+     * window: the raw bytes stay untouched, only 16 bytes of metadata change.
+     */
+    private void cropDngIfWide(java.io.File f) {
+        java.io.RandomAccessFile raf = null;
+        try {
+            raf = new java.io.RandomAccessFile(f, "rw");
+            byte[] hdr = readAt(raf, 0, 8);
+            if (hdr == null) {
+                return;
+            }
+            boolean le;
+            if (hdr[0] == 'I' && hdr[1] == 'I') {
+                le = true;
+            } else if (hdr[0] == 'M' && hdr[1] == 'M') {
+                le = false;
+            } else {
+                return;
+            }
+            if (rd16(hdr, 2, le) != 42) {
+                return;
+            }
+            long ifd0 = rd32(hdr, 4, le);
+            byte[] c0 = readAt(raf, ifd0, 2);
+            if (c0 == null) {
+                return;
+            }
+            int n0 = rd16(c0, 0, le);
+            if (n0 <= 0 || n0 > 512) {
+                return;
+            }
+            byte[] ifd0B = readAt(raf, ifd0, 2 + n0 * 12);
+            if (ifd0B == null) {
+                return;
+            }
+            long subOff = -1;
+            for (int i = 0; i < n0; i++) {
+                int p = 2 + i * 12;
+                if (rd16(ifd0B, p, le) == 0x014A) {
+                    int typ = rd16(ifd0B, p + 2, le);
+                    int cnt = rd32(ifd0B, p + 4, le);
+                    if (typ == 4 && cnt >= 1) {
+                        subOff = rd32(ifd0B, p + 8, le);
+                    }
+                }
+            }
+            if (subOff <= 0) {
+                return;
+            }
+            byte[] cs = readAt(raf, subOff, 2);
+            if (cs == null) {
+                return;
+            }
+            int ns = rd16(cs, 0, le);
+            if (ns <= 0 || ns > 512) {
+                return;
+            }
+            byte[] sub = readAt(raf, subOff, 2 + ns * 12);
+            if (sub == null) {
+                return;
+            }
+            long originVal = -1;
+            long sizeVal = -1;
+            long activeAreaVal = -1;
+            long curW = -1;
+            long curH = -1;
+            for (int i = 0; i < ns; i++) {
+                int p = 2 + i * 12;
+                int tag = rd16(sub, p, le);
+                int typ = rd16(sub, p + 2, le);
+                int cnt = rd32(sub, p + 4, le);
+                if (typ != 5 || cnt != 2) {
+                    if (tag == 0x0100 && typ == 4) {
+                        curW = rd32(sub, p + 8, le);
+                    } else if (tag == 0x0101 && typ == 4) {
+                        curH = rd32(sub, p + 8, le);
+                    } else if (tag == 0xC68D && typ == 4 && cnt == 4) {
+                        activeAreaVal = rd32(sub, p + 8, le);
+                    }
+                    continue;
+                }
+                long vo = rd32(sub, p + 8, le);
+                if (tag == 0xC61F) {
+                    originVal = vo;
+                } else if (tag == 0xC620) {
+                    sizeVal = vo;
+                }
+            }
+            if (originVal < 0 || sizeVal < 0 || curW <= 0 || curH <= 0) {
+                return;
+            }
+            // Already cropped: stop here. Writing the tags refreshes mtime, so
+            // the scanner sees the file again; without this guard it would be
+            // rewritten every poll (about 700ms) until the wide window closes.
+            byte[] doneCrop = readAt(raf, sizeVal, 16);
+            if (doneCrop != null) {
+                long cw = rd32(doneCrop, 0, le);
+                long ch = rd32(doneCrop, 8, le);
+                boolean cropOk = cw > 0 && ch > 0
+                        && Math.abs((double) cw / ch - TARGET_RATIO) < 0.01;
+                boolean areaOk = true;
+                if (activeAreaVal > 0) {
+                    byte[] aa = readAt(raf, activeAreaVal, 16);
+                    if (aa != null) {
+                        long top = rd32(aa, 0, le);
+                        long bottom = rd32(aa, 8, le);
+                        areaOk = (bottom - top) == ch;
+                    }
+                }
+                if (cropOk && areaOk) {
+                    return;
+                }
+            }
+            long w = curW;
+            long h = curH;
+            int nw;
+            int nh;
+            int ox;
+            int oy;
+            if (w >= h) {
+                nw = (int) w;
+                nh = (int) Math.round(w / TARGET_RATIO);
+                ox = 0;
+                oy = (int) ((h - nh) / 2);
+            } else {
+                nh = (int) h;
+                nw = (int) Math.round(h / TARGET_RATIO);
+                ox = (int) ((w - nw) / 2);
+                oy = 0;
+            }
+            if (nw <= 0 || nh <= 0 || ox < 0 || oy < 0) {
+                return;
+            }
+            // DefaultCropOrigin is measured from the top-left of ActiveArea, so
+            // once ActiveArea itself is narrowed the origin has to go to zero.
+            byte[] ov = new byte[16];
+            wr32(ov, 0, activeAreaVal > 0 ? 0 : ox, le);
+            wr32(ov, 4, 1, le);
+            wr32(ov, 8, activeAreaVal > 0 ? 0 : oy, le);
+            wr32(ov, 12, 1, le);
+            raf.seek(originVal);
+            raf.write(ov);
+            // OPPO's own raw renderer ignores DefaultCrop and draws the whole
+            // ActiveArea, which is why a RAW MAX shot snapped back to full
+            // frame after the preview flashed. Narrow ActiveArea to match.
+            if (activeAreaVal > 0) {
+                byte[] av = new byte[16];
+                wr32(av, 0, oy, le);
+                wr32(av, 4, ox, le);
+                wr32(av, 8, oy + nh, le);
+                wr32(av, 12, ox + nw, le);
+                raf.seek(activeAreaVal);
+                raf.write(av);
+            }
+            byte[] sv = new byte[16];
+            wr32(sv, 0, nw, le);
+            wr32(sv, 4, 1, le);
+            wr32(sv, 8, nh, le);
+            wr32(sv, 12, 1, le);
+            raf.seek(sizeVal);
+            raf.write(sv);
+            log("post-proc dng crop " + f.getName() + " " + w + "x" + h
+                    + " -> " + nw + "x" + nh + " origin=" + ox + "," + oy);
+            notifyMedia(f, null);
+        } catch (Throwable t) {
+            log("post-proc dng error: " + t);
+        } finally {
+            try {
+                if (raf != null) {
+                    raf.close();
+                }
+            } catch (Throwable ignored) {
+            }
+        }
+    }
+
+    /** EXIF tags carried over to the re-encoded DNG preview. */
+    private static final String[] PREVIEW_EXIF = new String[]{
+            "DateTime", "DateTimeOriginal", "DateTimeDigitized",
+            "OffsetTimeOriginal", "Make", "Model", "Orientation", "Software",
+            "FNumber", "ApertureValue", "ExposureTime", "ShutterSpeedValue",
+            "ISOSpeedRatings", "FocalLength", "FocalLengthIn35mmFilm",
+            "WhiteBalance", "Flash", "ExposureBiasValue", "MeteringMode",
+            "SceneCaptureType", "ExposureProgram", "ImageUniqueID",
+            "LensMake", "LensModel", "LensSerialNumber", "BodySerialNumber",
+    };
+
+    /** Copy the preview's own EXIF block onto the re-encoded JPEG. */
+    private static void copyPreviewExif(byte[] srcJpeg, java.io.File dst) {
+        try {
+            android.media.ExifInterface in = new android.media.ExifInterface(
+                    new java.io.ByteArrayInputStream(srcJpeg));
+            android.media.ExifInterface out =
+                    new android.media.ExifInterface(dst.getAbsolutePath());
+            for (String t : PREVIEW_EXIF) {
+                String v = in.getAttribute(t);
+                if (v != null && v.length() > 0) {
+                    out.setAttribute(t, v);
+                }
+            }
+            out.setAttribute("Orientation", "1");
+            out.saveAttributes();
+        } catch (Throwable t) {
+            log("dng preview exif error: " + t);
+        }
+    }
+
+    /**
+     * A DNG carries its own full-size JPEG preview inside IFD0's strip, and
+     * that preview - not the raw - is what the gallery renders; it also ignores
+     * DefaultCrop. So the preview has to be cropped too: decode the strip,
+     * centre-crop 65:24, re-encode, append it at the end of the file and point
+     * StripOffsets / StripByteCounts (plus the size tags) at the new copy.
+     * Nothing already in the file moves, so every existing offset stays valid.
+     */
+    private void cropDngPreview(java.io.File f) {
+        java.io.RandomAccessFile raf = null;
+        java.io.File tmp = null;
+        android.graphics.Bitmap src = null;
+        android.graphics.Bitmap cut = null;
+        try {
+            raf = new java.io.RandomAccessFile(f, "rw");
+            byte[] hdr = readAt(raf, 0, 8);
+            if (hdr == null) {
+                return;
+            }
+            boolean le;
+            if (hdr[0] == 'I' && hdr[1] == 'I') {
+                le = true;
+            } else if (hdr[0] == 'M' && hdr[1] == 'M') {
+                le = false;
+            } else {
+                return;
+            }
+            if (rd16(hdr, 2, le) != 42) {
+                return;
+            }
+            long ifd0 = rd32(hdr, 4, le);
+            byte[] c0 = readAt(raf, ifd0, 2);
+            if (c0 == null) {
+                return;
+            }
+            int n0 = rd16(c0, 0, le);
+            if (n0 <= 0 || n0 > 512) {
+                return;
+            }
+            byte[] ifd0B = readAt(raf, ifd0, 2 + n0 * 12);
+            if (ifd0B == null) {
+                return;
+            }
+            long stripOff = -1;
+            long stripLen = -1;
+            long soAt = -1;
+            long slAt = -1;
+            long wAt = -1;
+            long hAt = -1;
+            long w0 = -1;
+            long h0 = -1;
+            for (int i = 0; i < n0; i++) {
+                int p = 2 + i * 12;
+                int tag = rd16(ifd0B, p, le);
+                int typ = rd16(ifd0B, p + 2, le);
+                int cnt = rd32(ifd0B, p + 4, le);
+                if (typ != 4 || cnt != 1) {
+                    continue;
+                }
+                if (tag == 0x0111) {
+                    stripOff = rd32(ifd0B, p + 8, le);
+                    soAt = ifd0 + p + 8;
+                } else if (tag == 0x0117) {
+                    stripLen = rd32(ifd0B, p + 8, le);
+                    slAt = ifd0 + p + 8;
+                } else if (tag == 0x0100) {
+                    w0 = rd32(ifd0B, p + 8, le);
+                    wAt = ifd0 + p + 8;
+                } else if (tag == 0x0101) {
+                    h0 = rd32(ifd0B, p + 8, le);
+                    hAt = ifd0 + p + 8;
+                }
+            }
+            // Already replaced by an earlier pass: the size tags we write back
+            // are 65:24, so stop rather than appending another copy every poll.
+            if (w0 > 0 && h0 > 0
+                    && Math.abs((double) w0 / h0 - TARGET_RATIO) < 0.01) {
+                return;
+            }
+            if (stripOff <= 8 || soAt <= 0 || slAt <= 0) {
+                return;
+            }
+            if (stripLen <= 1024 || stripLen > 64L * 1024 * 1024) {
+                return;
+            }
+            byte[] prev = readAt(raf, stripOff, (int) stripLen);
+            if (prev == null || prev.length < 4) {
+                return;
+            }
+            if ((prev[0] & 0xFF) != 0xFF || (prev[1] & 0xFF) != 0xD8) {
+                return;
+            }
+            android.graphics.BitmapFactory.Options o =
+                    new android.graphics.BitmapFactory.Options();
+            o.inPreferredConfig = android.graphics.Bitmap.Config.ARGB_8888;
+            src = android.graphics.BitmapFactory.decodeByteArray(prev, 0, prev.length, o);
+            if (src == null) {
+                return;
+            }
+            int[] crop = centredWideCrop(src.getWidth(), src.getHeight());
+            if (crop == null) {
+                return;
+            }
+            cut = android.graphics.Bitmap.createBitmap(src, crop[0], crop[1], crop[2], crop[3]);
+            java.io.ByteArrayOutputStream bos = new java.io.ByteArrayOutputStream();
+            if (!cut.compress(android.graphics.Bitmap.CompressFormat.JPEG, 95, bos)) {
+                return;
+            }
+            byte[] nb = bos.toByteArray();
+            if (nb.length < 1024) {
+                return;
+            }
+            tmp = new java.io.File(f.getParentFile(), f.getName() + ".wfp");
+            java.io.FileOutputStream fo = new java.io.FileOutputStream(tmp);
+            fo.write(nb);
+            fo.close();
+            copyPreviewExif(prev, tmp);
+            nb = readAllBytes(tmp);
+            if (nb == null || nb.length < 1024) {
+                return;
+            }
+            long newOff = raf.length();
+            raf.seek(newOff);
+            raf.write(nb);
+            byte[] four = new byte[4];
+            wr32(four, 0, (int) newOff, le);
+            raf.seek(soAt);
+            raf.write(four);
+            wr32(four, 0, nb.length, le);
+            raf.seek(slAt);
+            raf.write(four);
+            if (wAt > 0) {
+                wr32(four, 0, crop[2], le);
+                raf.seek(wAt);
+                raf.write(four);
+            }
+            if (hAt > 0) {
+                wr32(four, 0, crop[3], le);
+                raf.seek(hAt);
+                raf.write(four);
+            }
+            log("post-proc dng preview " + f.getName() + " strip " + stripLen
+                    + " -> " + nb.length + " " + crop[2] + "x" + crop[3]);
+        } catch (Throwable t) {
+            log("post-proc dng preview error: " + t);
+        } finally {
+            try {
+                if (src != null) {
+                    src.recycle();
+                }
+                if (cut != null) {
+                    cut.recycle();
+                }
+            } catch (Throwable ignored) {
+            }
+            try {
+                if (raf != null) {
+                    raf.close();
+                }
+            } catch (Throwable ignored) {
+            }
+            if (tmp != null) {
+                try {
+                    tmp.delete();
+                } catch (Throwable ignored) {
+                }
+            }
+        }
+    }
+
     private void startPostProcessor() {
         if (mPostProcStarted) return;
         mPostProcStarted = true;
@@ -1987,12 +2343,15 @@ public class WideCameraHook implements IXposedHookLoadPackage {
                             try {
                                 String n = f.getName().toLowerCase();
                                 boolean heic = n.endsWith(".heic") || n.endsWith(".heif");
-                                if (!(n.endsWith(".jpg") || n.endsWith(".jpeg") || heic)) continue;
+                                boolean dng = n.endsWith(".dng");
+                                if (!(n.endsWith(".jpg") || n.endsWith(".jpeg") || heic || dng)) {
+                                    continue;
+                                }
                                 // Whitelist: only touch photos produced by OPPO Camera itself
                                 // (IMG + 14-digit timestamp). Third-party apps (watermark
                                 // cameras, GCam, etc.) drop differently-named files into the
                                 // same folders and must NOT be cropped by us.
-                                if (!n.matches("img\\d{14}(_\\d+)?\\.(jpg|jpeg|heic|heif)")) continue;
+                                if (!n.matches("img\\d{14}(_\\d+)?\\.(jpg|jpeg|heic|heif|dng)")) continue;
                                 long len = f.length();
                                 if (len < 300000) continue;
                                 long mt = f.lastModified();
@@ -2032,6 +2391,23 @@ public class WideCameraHook implements IXposedHookLoadPackage {
                                 String sig = mt + ":" + len;
                                 String seenAt = mCropSeen.get(path);
                                 if (sig.equals(seenAt)) {
+                                    continue;
+                                }
+                                if (dng) {
+                                    // RAW / RAW MAX 落盘的是 DNG，raw 数据没法逐
+                                    // 像素重裁：改它的裁剪标签，并把内嵌预览一起裁。
+                                    // The first byte lands long before the file is
+                                    // finished: the camera keeps appending for
+                                    // seconds and its own closing flush overwrites
+                                    // anything written mid-flight. So wait until two
+                                    // consecutive polls agree on the length, then
+                                    // rewrite, and only then mark the file as done.
+                                    if (prev == null || prev.longValue() != len) {
+                                        continue;
+                                    }
+                                    cropDngIfWide(f);
+                                    cropDngPreview(f);
+                                    mCropSeen.put(path, sig);
                                     continue;
                                 }
                                 mCropSeen.put(path, sig);
@@ -2178,144 +2554,11 @@ public class WideCameraHook implements IXposedHookLoadPackage {
         }
     }
 
-    /**
-     * HEIF ("高效图片存储") bypasses every JPEG crop hook: the camera hands the
-     * raw frame to com.oplus.media.OplusHeifWriter, which does the HEVC encode
-     * itself. This hook only observes that path for now - it records the
-     * encoder's declared size and logs the pixel buffer length so the crop can
-     * be added once the exact layout (RGBA vs YUV, dims) is confirmed. Guessing
-     * wrong would corrupt the saved frame, so this first build observes only.
-     */
-    private void hookOplusHeifWriter(final XC_LoadPackage.LoadPackageParam lp) {
-        try {
-            XposedHelpers.findAndHookMethod(
-                    "com.oplus.media.OplusHeifWriter", lp.classLoader,
-                    "createPrimaryImage",
-                    int.class, int.class, int.class, int.class,
-                    int.class, int.class, int.class,
-                    new XC_MethodHook() {
-                        @Override
-                        protected void beforeHookedMethod(MethodHookParam param) {
-                            try {
-                                int w = (Integer) param.args[0];
-                                int h = (Integer) param.args[1];
-                                sHeifDims.put(System.identityHashCode(param.thisObject),
-                                        new int[]{w, h});
-                                log("heif createPrimaryImage w=" + w + " h=" + h
-                                        + " a2=" + param.args[2] + " a3=" + param.args[3]
-                                        + " a4=" + param.args[4] + " a5=" + param.args[5]
-                                        + " a6=" + param.args[6] + " wide=" + mWideActive);
-                            } catch (Throwable t) {
-                                log("heif createPrimaryImage hook error: " + t);
-                            }
-                        }
-                    });
-            log("hooked OplusHeifWriter.createPrimaryImage");
-        } catch (Throwable t) {
-            log("hook OplusHeifWriter.createPrimaryImage FAILED: " + t);
-        }
-        try {
-            XposedHelpers.findAndHookMethod(
-                    "com.oplus.media.OplusHeifWriter", lp.classLoader,
-                    "processPrimaryImage",
-                    byte[].class, byte[].class, java.io.FileDescriptor.class,
-                    new XC_MethodHook() {
-                        @Override
-                        protected void beforeHookedMethod(MethodHookParam param) {
-                            try {
-                                byte[] px = (byte[]) param.args[0];
-                                byte[] exif = (byte[]) param.args[1];
-                                int len = (px == null) ? -1 : px.length;
-                                int[] wh = sHeifDims.get(
-                                        System.identityHashCode(param.thisObject));
-                                String dims = (wh == null) ? "?" : (wh[0] + "x" + wh[1]);
-                                long rgba = (wh == null) ? -1L : (long) wh[0] * wh[1] * 4L;
-                                log("heif processPrimaryImage len=" + len
-                                        + " exifLen=" + (exif == null ? -1 : exif.length)
-                                        + " dims=" + dims + " rgba=" + rgba
-                                        + " wide=" + mWideActive);
-                            } catch (Throwable t) {
-                                log("heif processPrimaryImage hook error: " + t);
-                            }
-                        }
-                    });
-            log("hooked OplusHeifWriter.processPrimaryImage");
-        } catch (Throwable t) {
-            log("hook OplusHeifWriter.processPrimaryImage FAILED: " + t);
-        }
-    }
-
-    /**
-     * "高效图片存储" (HEIF) hands the frame to a native HEVC encoder that never
-     * passes through any of the JPEG crop hooks, so a wide HEIC ships
-     * full-frame. Re-encoding HEVC in-process is not worth the risk, so instead
-     * answer the picture pipeline's HEIF-format read with "off" while the wide
-     * band is active: wide shots then take the ordinary JPEG path the crop hooks
-     * already cover, and every other ratio keeps following the user's setting.
-     */
-    private void hookHeifFormatSwitch(final XC_LoadPackage.LoadPackageParam lp) {
-        try {
-            Class<?> dataKeyClass = lp.classLoader.loadClass("com.oplus.camera.data.DataKey");
-            XposedHelpers.findAndHookMethod(
-                    "com.oplus.camera.data.DataManager", lp.classLoader,
-                    "b", dataKeyClass, Object.class,
-                    new XC_MethodHook() {
-                        @Override
-                        protected void afterHookedMethod(MethodHookParam param) {
-                            heifGate(param, "b", lp);
-                        }
-                    });
-            XposedHelpers.findAndHookMethod(
-                    "com.oplus.camera.data.DataManager", lp.classLoader,
-                    "c", dataKeyClass,
-                    new XC_MethodHook() {
-                        @Override
-                        protected void afterHookedMethod(MethodHookParam param) {
-                            heifGate(param, "c", lp);
-                        }
-                    });
-            log("hooked DataManager heif-format gate");
-        } catch (Throwable t) {
-            log("hook DataManager heif-format FAILED: " + t);
-        }
-    }
-
-    /**
-     * Shared body for both DataManager readers. Only the HEIF-format keys are
-     * touched, and only while the wide band is active; the replacement is
-     * coerced to whatever type the camera's own read declared.
-     */
-    private void heifGate(XC_MethodHook.MethodHookParam param, String which,
-                          XC_LoadPackage.LoadPackageParam lp) {
-        try {
-            Object key = param.args[0];
-            if (key == null) {
-                return;
-            }
-            String hit = null;
-            for (String n : keyFields(key)) {
-                if (n != null && n.contains("heif_format")) {
-                    hit = n;
-                    break;
-                }
-            }
-            if (hit == null) {
-                return;
-            }
-            Object cur = param.getResult();
-            boolean wide = mWideActive || isWideSelected(lp);
-            log("heif fmt probe " + which + " " + hit + " wide=" + wide + " val=" + cur);
-            if (!wide) {
-                return;
-            }
-            Object off = (cur instanceof String) ? "jpeg"
-                    : (cur instanceof Integer) ? Integer.valueOf(0)
-                    : Boolean.FALSE;
-            param.setResult(off);
-            log("heif fmt forced jpeg (was " + cur + ")");
-        } catch (Throwable ignored) {
-        }
-    }
+    // Resolved once. loadClass and getDeclaredMethod both walk the class loader
+    // and take its lock, and the watermark gate calls this on every switch read
+    // while the watermark panel is open. The DataManager class never changes,
+    // so looking it up again on each call was pure overhead.
+    private static volatile java.lang.reflect.Method sDmGetInstance = null;
 
     private boolean isWideSelected(XC_LoadPackage.LoadPackageParam lp) {
         if (mWideActive) {
@@ -2325,9 +2568,14 @@ public class WideCameraHook implements IXposedHookLoadPackage {
             if (mRatioDataKey == null) {
                 return false;
             }
-            Class<?> dmClass = lp.classLoader.loadClass("com.oplus.camera.data.DataManager");
-            java.lang.reflect.Method gm = dmClass.getDeclaredMethod("getInstance");
-            gm.setAccessible(true);
+            java.lang.reflect.Method gm = sDmGetInstance;
+            if (gm == null) {
+                Class<?> dmClass = lp.classLoader
+                        .loadClass("com.oplus.camera.data.DataManager");
+                gm = dmClass.getDeclaredMethod("getInstance");
+                gm.setAccessible(true);
+                sDmGetInstance = gm;
+            }
             Object dm = gm.invoke(null);
             Object raw = XposedHelpers.callMethod(dm, "c", mRatioDataKey);
             return "wide".equals(raw);
@@ -2364,22 +2612,79 @@ public class WideCameraHook implements IXposedHookLoadPackage {
         return false;
     }
 
+    // Built once. The old code allocated a fresh SimpleDateFormat on every
+    // line, and the post-processor logs on each poll while a shot is in
+    // flight - that churn showed up as measurable garbage on the camera
+    // process's heap for no reason.
+    private static final java.text.SimpleDateFormat LOG_FMT =
+            new java.text.SimpleDateFormat("HH:mm:ss.SSS", java.util.Locale.US);
+    // The durable log is append-only and lives on /sdcard, so without a cap it
+    // grows for as long as the module is installed. One rollover file is kept,
+    // which bounds the pair at 2x this size.
+    private static final long LOG_MAX_BYTES = 1024L * 1024L;
+    // The log paths deliberately do NOT live here as class-level constants. A
+    // declared field survives compilation even when nothing reads it, so the
+    // /sdcard strings would stay visible in a release dex. They sit inside
+    // log() behind the compile-time LOG_ENABLED check instead, which javac
+    // folds away completely.
+    private static volatile java.io.File sLogFile = null;
+    private static volatile java.io.File sLogOld = null;
+    private static volatile boolean sLogDirReady = false;
+    private static int sLogWrites = 0;
+
     private static void log(String msg) {
+        // Release builds carry no logger at all. The whole body lives inside a
+        // branch on a Gradle-generated static final, so javac folds the
+        // condition and drops the block outright - an early return would leave
+        // every string and the /sdcard write sitting in the dex.
+        if (BuildConfig.LOG_ENABLED) {
         XposedBridge.log("[" + TAG + "] " + msg);
         // Durable file log: logcat gets flooded by other processes before we can
         // read it back. Append to a file the camera process can definitely write.
         try {
-            java.io.File f = new java.io.File(
-                    "/sdcard/Android/data/com.oplus.camera/files/WideCamera.log");
-            java.io.File parent = f.getParentFile();
-            if (parent != null && !parent.exists()) {
-                parent.mkdirs();
+            if (!sLogDirReady) {
+                sLogDirReady = true;
+                java.io.File dir = new java.io.File(
+                        "/storage/emulated/0/Android/WideFormat+/log");
+                if (!dir.isDirectory()) {
+                    dir.mkdirs();
+                }
+                // An existing directory proves nothing here: FUSE can hand back a
+                // path that lists fine and still refuses every write.
+                if (!dir.isDirectory() || !dir.canWrite()) {
+                    dir = new java.io.File(
+                            "/sdcard/Android/data/com.oplus.camera/files/WideFormatPlus/log");
+                    if (!dir.isDirectory()) {
+                        dir.mkdirs();
+                    }
+                }
+                if (dir.isDirectory() && dir.canWrite()) {
+                    sLogFile = new java.io.File(dir, "WideCamera.log");
+                    sLogOld = new java.io.File(dir, "WideCamera.log.1");
+                }
+            }
+            java.io.File f = sLogFile;
+            if (f == null) {
+                return;
+            }
+            // length() is a syscall and /sdcard is FUSE, so only probe
+            // every 32nd line instead of on every write.
+            if ((++sLogWrites & 31) == 0 && f.length() > LOG_MAX_BYTES) {
+                java.io.File old = sLogOld;
+                if (old != null) {
+                    old.delete();
+                    f.renameTo(old);
+                }
+            }
+            String stamp;
+            synchronized (LOG_FMT) {
+                stamp = LOG_FMT.format(new java.util.Date());
             }
             java.io.FileWriter w = new java.io.FileWriter(f, true);
-            w.write(new java.text.SimpleDateFormat("HH:mm:ss.SSS", java.util.Locale.US)
-                    .format(new java.util.Date()) + " " + msg + "\n");
+            w.write(stamp + " " + msg + "\n");
             w.close();
         } catch (Throwable ignored) {
+        }
         }
     }
 }
