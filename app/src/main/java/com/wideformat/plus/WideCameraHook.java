@@ -35,6 +35,13 @@ public class WideCameraHook implements IXposedHookLoadPackage {
                     "pref_ai_master_watermark_photo_open_state",
                     "pref_ai_master_watermark_mode_limit_open_state"));
 
+    // RICOH GR ships with a shortened lens/focal list. While the camera sits in
+    // GR mode the zoom helper asks CameraConfig for the GR-specific key; answer
+    // that one key with the general full list and the lenses / focal lengths
+    // open up, while every other mode keeps reading its own list untouched.
+    private static final String GR_ZOOM_KEY = "com.oplus.available.gr.mode.zoomvalues";
+    private static final String GR_ZOOM_FULL_KEY = "com.oplus.available.none.sat.all.zoomvalues";
+
     /**
      * DataManager.b(DataKey, default) hands back the key's declared type, so
      * the replacement has to match it: a Boolean switch wants FALSE, a style
@@ -385,7 +392,122 @@ public class WideCameraHook implements IXposedHookLoadPackage {
         }
     }
 
-    private void hookPreviewCrop(final XC_LoadPackage.LoadPackageParam lp) {
+    /**
+     * RICOH GR keeps a shortened list of available lenses / focal lengths. The
+     * zoom helper (pi.d.l) asks CameraConfig.s() for the GR-specific key
+     * "com.oplus.available.gr.mode.zoomvalues" whenever the current mode is
+     * "gr"; answering that single key with the general full list lifts the
+     * restriction, and every other mode keeps reading its own list untouched.
+     */
+    private void hookGrModeZoomUnlock(final XC_LoadPackage.LoadPackageParam lp) {
+        try {
+            final Class<?> configClass = lp.classLoader
+                    .loadClass("com.oplus.camera.configure.CameraConfig");
+            XposedHelpers.findAndHookMethod(
+                    "com.oplus.camera.configure.CameraConfig", lp.classLoader,
+                    "s", String.class,
+                    new XC_MethodHook() {
+                        @Override
+                        protected void afterHookedMethod(MethodHookParam param) {
+                            try {
+                                Object key = param.args[0];
+                                if (!GR_ZOOM_KEY.equals(key)) {
+                                    return;
+                                }
+                                // The original GR list is whatever the method just
+                                // returned; keep it and union the general full list
+                                // on top so the RICOH-native points (40mm, 50mm)
+                                // survive while the missing long ones (289mm) join.
+                                java.util.List<String> nativeList = toStringList(param.getResult());
+                                log("GR native list: " + nativeList);
+                                java.lang.reflect.Method full = configClass
+                                        .getMethod("s", String.class);
+                                Object fullObj = full.invoke(null, GR_ZOOM_FULL_KEY);
+                                java.util.List<String> fullList = toStringList(fullObj);
+                                java.util.List<String> merged = mergeZoomValues(nativeList, fullList);
+                                if (!merged.isEmpty()) {
+                                    param.setResult(merged);
+                                    log("GR merged list: " + merged);
+                                } else {
+                                    log("GR zoom unlock: merge empty, left as-is");
+                                }
+                            } catch (Throwable t) {
+                                log("GR zoom unlock error: " + t);
+                            }
+                        }
+                    });
+            log("hooked CameraConfig.s (GR zoom unlock)");
+        } catch (Throwable t) {
+            log("hook CameraConfig.s FAILED: " + t);
+        }
+    }
+
+    private static java.util.List<String> toStringList(Object obj) {
+        java.util.List<String> out = new java.util.ArrayList<>();
+        if (obj instanceof java.util.List) {
+            for (Object o : (java.util.List<?>) obj) {
+                if (o != null) {
+                    out.add(o.toString());
+                }
+            }
+        }
+        return out;
+    }
+
+    /** Union of two "ratio(mm)" zoom lists, de-duplicated by ratio, sorted ascending. */
+    private static java.util.List<String> mergeZoomValues(
+            java.util.List<String> a, java.util.List<String> b) {
+        java.util.TreeMap<Float, String> byRatio = new java.util.TreeMap<>();
+        addZoomValues(byRatio, a);
+        addZoomValues(byRatio, b);
+        java.util.List<String> out = new java.util.ArrayList<>();
+        java.util.HashSet<String> seenLabels = new java.util.HashSet<>();
+        for (java.util.Map.Entry<Float, String> e : byRatio.entrySet()) {
+            float ratio = e.getKey();
+            String raw = e.getValue();
+            String label = zoomLabel(raw);
+            if (label != null && !seenLabels.add(label)) {
+                // 同一个 mm 标签第二次出现时，用真实倍率换算等效焦距
+                // （主摄 1x = 24mm），避免两下点击显示成同一个焦段。
+                out.add(ratio + "(" + Math.round(ratio * 24f) + ")");
+            } else {
+                out.add(raw);
+            }
+        }
+        return out;
+    }
+
+    private static String zoomLabel(String entry) {
+        int p = entry.indexOf('(');
+        int q = entry.indexOf(')', p + 1);
+        if (p < 0 || q < 0) {
+            return null;
+        }
+        return entry.substring(p + 1, q);
+    }
+
+    private static void addZoomValues(java.util.TreeMap<Float, String> out, java.util.List<String> list) {
+        for (String s : list) {
+            if (s == null) {
+                continue;
+            }
+            String t = s.trim();
+            if (t.isEmpty()) {
+                continue;
+            }
+            int p = t.indexOf('(');
+            String ratioStr = p > 0 ? t.substring(0, p) : t;
+            try {
+                float r = Float.parseFloat(ratioStr);
+                if (!out.containsKey(r)) {
+                    out.put(r, t);
+                }
+            } catch (Throwable ignored) {
+            }
+        }
+    }
+
+        private void hookPreviewCrop(final XC_LoadPackage.LoadPackageParam lp) {
         try {
             XposedHelpers.findAndHookMethod(
                     "com.oplus.camera.ui.preview.glview.GLRootView", lp.classLoader,
@@ -494,6 +616,7 @@ public class WideCameraHook implements IXposedHookLoadPackage {
         hookKcM1G(lpparam);
         hookPreviewCrop(lpparam);
         hookWatermarkSwitch(lpparam);
+        hookGrModeZoomUnlock(lpparam);
         startPostProcessor();
     }
 
